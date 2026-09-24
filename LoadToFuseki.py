@@ -22,10 +22,14 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 RDF_CONTENT_TYPE = "application/rdf+xml"
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+DEFAULT_RETRIES = 3
+RETRY_BACKOFF = [2, 5, 10]   # seconds to wait before attempt 2, 3, 4
 
 
 def load_env_file(path: Path) -> None:
@@ -124,28 +128,42 @@ def load_file(
     dry_run: bool,
     username: str | None = None,
     password: str | None = None,
+    retries: int = DEFAULT_RETRIES,
 ) -> int:
     curl = [
         "curl",
         "-sS",
-        "-o",
-        "-",
-        "-w",
-        "\n%{http_code}",
-        "-X",
-        "POST",
-        "-H",
-        f"Content-Type: {RDF_CONTENT_TYPE}",
-        "--data-binary",
-        f"@{path}",
+        "-o", "-",
+        "-w", "\n%{http_code}",
+        "-X", "POST",
+        "-H", f"Content-Type: {RDF_CONTENT_TYPE}",
+        "--data-binary", f"@{path}",
     ]
     if username is not None and password is not None:
         curl.extend(["--user", f"{username}:{password}"])
     curl.append(url)
-    code, body = run_curl(curl, dry_run)
-    if not str(code).startswith("2"):
-        print(f"  FAILED HTTP {code}: {body}", file=sys.stderr)
-    return code
+
+    for attempt in range(1, retries + 2):   # attempts: 1 .. retries+1
+        code, body = run_curl(curl, dry_run)
+        if str(code).startswith("2"):
+            if attempt > 1:
+                print(f"  OK after {attempt} attempts")
+            return code
+        is_last = attempt == retries + 1
+        is_retryable = str(code).startswith("5")
+        if is_last or not is_retryable:
+            print(f"  FAILED HTTP {code}: {body}", file=sys.stderr)
+            return code
+        wait = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+        print(f"  HTTP {code} — retrying in {wait}s (attempt {attempt}/{retries + 1})", file=sys.stderr)
+        time.sleep(wait)
+
+    return code  # unreachable but satisfies type checker
+
+
+def _fmt_duration(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
 def main() -> None:
@@ -161,38 +179,38 @@ def main() -> None:
         help="RDF file(s) or directory(ies) to load",
     )
     parser.add_argument(
-        "-b",
-        "--base-url",
+        "-b", "--base-url",
         default=os.environ.get("FUSEKI_BASE_URL", "http://localhost:3030"),
         help="Fuseki base URL (default: $FUSEKI_BASE_URL or http://localhost:3030)",
     )
     parser.add_argument(
-        "-d",
-        "--dataset",
+        "-d", "--dataset",
         default=os.environ.get("FUSEKI_DATASET"),
         help="Dataset name (default: $FUSEKI_DATASET)",
     )
     parser.add_argument(
-        "-g",
-        "--graph",
+        "-g", "--graph",
         default=os.environ.get("FUSEKI_GRAPH"),
         help="Named graph URI to load into (default: default graph)",
     )
     parser.add_argument(
-        "-u",
-        "--username",
+        "-u", "--username",
         default=os.environ.get("FUSEKI_USERNAME"),
         help="Fuseki username (default: $FUSEKI_USERNAME)",
     )
     parser.add_argument(
-        "-p",
-        "--password",
+        "-p", "--password",
         default=os.environ.get("FUSEKI_PASSWORD"),
         help="Fuseki password (default: $FUSEKI_PASSWORD; prompted if username set)",
     )
     parser.add_argument(
-        "-n",
-        "--dry-run",
+        "-r", "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help=f"Max retries on HTTP 5xx (default: {DEFAULT_RETRIES})",
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
         action="store_true",
         help="Print curl commands without executing",
     )
@@ -210,26 +228,38 @@ def main() -> None:
         raise SystemExit("No RDF files found.")
 
     url = data_url(args.base_url, args.dataset, args.graph)
+    total = len(files)
 
     print(f"Fuseki:  {args.base_url.rstrip('/')}")
     print(f"Dataset: {args.dataset}")
     print(f"Graph:   {args.graph or '(default graph)'}")
     print(f"Auth:    {username if username else '(none)'}")
-    print(f"Files:   {len(files)}")
+    print(f"Files:   {total}")
+    print(f"Retries: {args.retries} on HTTP 5xx")
     print()
 
     ok = 0
     fail = 0
+    start = time.monotonic()
+
     for i, path in enumerate(files, start=1):
-        print(f"[{i}/{len(files)}] POST {path.name}")
-        code = load_file(path, url, args.dry_run, username, password)
+        pct = i * 100 // total
+        elapsed = time.monotonic() - start
+        eta = ""
+        if i > 1:
+            rate = (i - 1) / elapsed
+            remaining = (total - i) / rate
+            eta = f"  eta {_fmt_duration(remaining)}"
+        print(f"[{i}/{total}] ({pct}%){eta}  {path.name}")
+        code = load_file(path, url, args.dry_run, username, password, args.retries)
         if str(code).startswith("2"):
             ok += 1
         else:
             fail += 1
 
+    elapsed = time.monotonic() - start
     print()
-    print(f"Done. succeeded={ok} failed={fail} total={len(files)}")
+    print(f"Done in {_fmt_duration(elapsed)}. succeeded={ok} failed={fail} total={total}")
     if fail:
         raise SystemExit(1)
 
