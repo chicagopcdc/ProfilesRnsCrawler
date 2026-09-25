@@ -9,8 +9,8 @@ Docs:
   https://jena.apache.org/documentation/fuseki2/fuseki-server-protocol.html
   https://www.w3.org/TR/sparql11-http-rdf-update/
 
-Authentication uses HTTP Basic Auth (--username / --password or env vars).
-The Fuseki admin password is set via the ADMIN_PASSWORD env var on the server.
+A single requests.Session is reused for all POSTs so that the TCP (and TLS)
+connection is kept alive across files, eliminating per-file handshake overhead.
 """
 
 from __future__ import annotations
@@ -18,12 +18,12 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
-import shlex
-import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
+
+import requests
+from requests.adapters import HTTPAdapter
 
 RDF_CONTENT_TYPE = "application/rdf+xml"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -61,7 +61,6 @@ def collect_files(paths: list[Path]) -> list[Path]:
 
 
 def data_url(base_url: str, dataset: str, graph: str | None = None) -> str:
-    """Return the Fuseki GSP write endpoint URL for the given dataset."""
     url = f"{base_url.rstrip('/')}/{dataset.strip('/')}/data"
     if graph:
         url += f"?graph={graph}"
@@ -71,7 +70,6 @@ def data_url(base_url: str, dataset: str, graph: str | None = None) -> str:
 def resolve_credentials(
     username: str | None, password: str | None
 ) -> tuple[str | None, str | None]:
-    """Return (username, password) for Basic auth, or (None, None) if unused."""
     if not username:
         if password:
             raise SystemExit(
@@ -84,81 +82,64 @@ def resolve_credentials(
     return username, password
 
 
-def redact_curl_args(args: list[str]) -> list[str]:
-    """Mask password in --user user:pass for dry-run output."""
-    redacted: list[str] = []
-    hide_next = False
-    for arg in args:
-        if hide_next:
-            if ":" in arg:
-                user, _, _ = arg.partition(":")
-                redacted.append(f"{user}:***")
-            else:
-                redacted.append("***")
-            hide_next = False
-            continue
-        if arg in ("-u", "--user"):
-            redacted.append(arg)
-            hide_next = True
-            continue
-        redacted.append(arg)
-    return redacted
-
-
-def run_curl(args: list[str], dry_run: bool) -> tuple[int, str]:
-    if dry_run:
-        print("  " + " ".join(shlex.quote(a) for a in redact_curl_args(args)))
-        return 204, ""
-    result = subprocess.run(args, capture_output=True, text=True)
-    body = (result.stdout or "") + (result.stderr or "")
-    http_code = 0
-    if result.stdout:
-        lines = result.stdout.strip().splitlines()
-        if lines and lines[-1].isdigit():
-            http_code = int(lines[-1])
-            body = "\n".join(lines[:-1]).strip()
-    if http_code == 0:
-        http_code = 500 if result.returncode != 0 else 200
-    return http_code, body
+def make_session(username: str | None, password: str | None) -> requests.Session:
+    session = requests.Session()
+    if username:
+        session.auth = (username, password)
+    # One connection pool per host; allow up to 4 connections (future parallelism)
+    adapter = HTTPAdapter(pool_connections=1, pool_maxsize=4)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def load_file(
+    session: requests.Session,
     path: Path,
     url: str,
     dry_run: bool,
-    username: str | None = None,
-    password: str | None = None,
     retries: int = DEFAULT_RETRIES,
 ) -> int:
-    curl = [
-        "curl",
-        "-sS",
-        "-o", "-",
-        "-w", "\n%{http_code}",
-        "-X", "POST",
-        "-H", f"Content-Type: {RDF_CONTENT_TYPE}",
-        "--data-binary", f"@{path}",
-    ]
-    if username is not None and password is not None:
-        curl.extend(["--user", f"{username}:{password}"])
-    curl.append(url)
+    if dry_run:
+        auth_hint = f" (auth: {session.auth[0]})" if session.auth else ""
+        print(f"  POST {url}{auth_hint}  < {path}")
+        return 204
 
-    for attempt in range(1, retries + 2):   # attempts: 1 .. retries+1
-        code, body = run_curl(curl, dry_run)
+    for attempt in range(1, retries + 2):
+        try:
+            with open(path, "rb") as f:
+                resp = session.post(
+                    url,
+                    data=f,
+                    headers={"Content-Type": RDF_CONTENT_TYPE},
+                    timeout=60,
+                )
+            code = resp.status_code
+        except requests.RequestException as exc:
+            code = 0
+            body = str(exc)
+        else:
+            body = resp.text
+
         if str(code).startswith("2"):
             if attempt > 1:
                 print(f"  OK after {attempt} attempts")
             return code
+
         is_last = attempt == retries + 1
-        is_retryable = str(code).startswith("5")
+        is_retryable = str(code).startswith("5") or code == 0
         if is_last or not is_retryable:
-            print(f"  FAILED HTTP {code}: {body}", file=sys.stderr)
+            print(f"  FAILED HTTP {code}: {body[:200]}", file=sys.stderr)
             return code
+
         wait = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
-        print(f"  HTTP {code} — retrying in {wait}s (attempt {attempt}/{retries + 1})", file=sys.stderr)
+        print(
+            f"  HTTP {code} — retrying in {wait}s (attempt {attempt}/{retries + 1})",
+            file=sys.stderr,
+        )
         time.sleep(wait)
 
-    return code  # unreachable but satisfies type checker
+    return code  # unreachable
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -212,17 +193,14 @@ def main() -> None:
     parser.add_argument(
         "-n", "--dry-run",
         action="store_true",
-        help="Print curl commands without executing",
+        help="Print what would be posted without sending",
     )
     args = parser.parse_args()
 
     if not args.dataset:
         parser.error("dataset name is required (-d / --dataset or FUSEKI_DATASET)")
-    if shutil.which("curl") is None:
-        raise SystemExit("curl is required on PATH")
 
     username, password = resolve_credentials(args.username, args.password)
-
     files = collect_files(args.paths)
     if not files:
         raise SystemExit("No RDF files found.")
@@ -242,20 +220,21 @@ def main() -> None:
     fail = 0
     start = time.monotonic()
 
-    for i, path in enumerate(files, start=1):
-        pct = i * 100 // total
-        elapsed = time.monotonic() - start
-        eta = ""
-        if i > 1:
-            rate = (i - 1) / elapsed
-            remaining = (total - i) / rate
-            eta = f"  eta {_fmt_duration(remaining)}"
-        print(f"[{i}/{total}] ({pct}%){eta}  {path.name}")
-        code = load_file(path, url, args.dry_run, username, password, args.retries)
-        if str(code).startswith("2"):
-            ok += 1
-        else:
-            fail += 1
+    with make_session(username, password) as session:
+        for i, path in enumerate(files, start=1):
+            pct = i * 100 // total
+            elapsed = time.monotonic() - start
+            eta = ""
+            if i > 1:
+                rate = (i - 1) / elapsed
+                remaining = (total - i) / rate
+                eta = f"  eta {_fmt_duration(remaining)}"
+            print(f"[{i}/{total}] ({pct}%){eta}  {path.name}")
+            code = load_file(session, path, url, args.dry_run, args.retries)
+            if str(code).startswith("2"):
+                ok += 1
+            else:
+                fail += 1
 
     elapsed = time.monotonic() - start
     print()
