@@ -5,6 +5,7 @@
 *.rdf
 .vscode/
 graphdb.env
+fuseki.env
 
 
 # Byte-compiled / optimized / DLL files
