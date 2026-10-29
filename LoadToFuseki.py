@@ -21,6 +21,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -63,7 +64,7 @@ def collect_files(paths: list[Path]) -> list[Path]:
 def data_url(base_url: str, dataset: str, graph: str | None = None) -> str:
     url = f"{base_url.rstrip('/')}/{dataset.strip('/')}/data"
     if graph:
-        url += f"?graph={graph}"
+        url += "?" + urlencode({"graph": graph})
     return url
 
 
@@ -77,7 +78,7 @@ def resolve_credentials(
                 "(use --username or FUSEKI_USERNAME)"
             )
         return None, None
-    if password is None:
+    if not password:
         password = getpass.getpass(f"Password for Fuseki user {username!r}: ")
     return username, password
 
